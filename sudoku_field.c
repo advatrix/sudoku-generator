@@ -8,7 +8,11 @@ void print(sudoku_field_t* sudoku_field) {
 
         for (int j = 0; j < sudoku_field->side_length; ++j) {
             if (j % REGION_SIDE_LENGTH == 0) printf("| ");
-            printf("%d ", sudoku_field->cells[i][j].value);
+            if (sudoku_field->cells[i][j].value == SUDOKU_EMPTY) {
+                printf("  ");
+            }
+            else
+                printf("%d ", sudoku_field->cells[i][j].value);
         }
 
         printf("|\n");
