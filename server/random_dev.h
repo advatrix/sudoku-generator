@@ -9,7 +9,7 @@
 #include <time.h>
 #include <stdlib.h>
 
-int random(int n);
+int random_number(int n);
 void seed();
 
 #endif //SERVER_RANDOM_DEV_H

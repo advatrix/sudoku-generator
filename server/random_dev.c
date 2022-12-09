@@ -4,7 +4,7 @@
 
 #include "random_dev.h"
 
-int random(int n) {
+int random_number(int n) {
     return rand() % n;
 }
 

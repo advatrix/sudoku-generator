@@ -19,7 +19,7 @@ int main() {
     sudoku_field_t swapped_again = swap_columns_small(&swapped);
     print(&swapped_again);
 
-    for (int i = 0; i < 40; ++i) {
+    for (int i = 0; i < 60; ++i) {
         remove_cell(&swapped_again);
         printf("%d\n", i);
     }
