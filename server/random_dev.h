@@ -9,7 +9,6 @@
 #include <time.h>
 #include <stdlib.h>
 
-int random_number(int n);
-void seed();
+u_int8_t random_number(int n);
 
 #endif //SERVER_RANDOM_DEV_H

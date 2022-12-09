@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 #include "grid.h"
+#include "random_dev.h"
 
 int main() {
     printf("Hello, World!\n");
