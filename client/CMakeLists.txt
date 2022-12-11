@@ -3,4 +3,4 @@ project(client C)
 
 set(CMAKE_C_STANDARD 99)
 
-add_executable(client main.c ../sudoku_field.c)
+add_executable(client main.c ../sudoku_field.c ../utils.c)
