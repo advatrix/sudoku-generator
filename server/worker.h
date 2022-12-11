@@ -5,7 +5,7 @@
 #ifndef SERVER_WORKER_H
 #define SERVER_WORKER_H
 
-
+#include "shared.h"
 
 
 

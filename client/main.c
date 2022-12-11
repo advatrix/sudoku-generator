@@ -42,6 +42,12 @@ int main(int argc, char *argv[]) {
     u_short response_status;
     read(sockfd, &response_status, sizeof(response_status));
     if (response_status == RESPONSE_OK) {
+        printf("Puzzle: \n");
+        sudoku_field_t puzzle;
+        read(sockfd, &puzzle, sizeof(puzzle));
+        print(&puzzle);
+
+        printf("\nSolution:\n");
         sudoku_field_t answer;
         read(sockfd, &answer, sizeof(answer));
         print(&answer);

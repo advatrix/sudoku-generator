@@ -9,6 +9,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
 
 #include "grid.h"
 #include "random_dev.h"
@@ -21,9 +24,30 @@
 #define LOGFILE "sudoku.log"
 #define MAXNAME 255
 #define LOG_MAX_MSG_SIZE 255
+#define SHARED_MEMORY_SIZE 1024
+#define MAX_SWAPS_NUM 50
 
+// todo привязать разделяемую память к глобальной переменной чтобы удалять её в term
 
-char config_name[MAXNAME+1], log_name[MAXNAME+1];
+typedef struct shared {
+    int semid;
+    sudoku_field_t field;
+} shared_t;
+
+shared_t *shared;
+
+struct sembuf sop_lock[2] = {
+        0, 0, 0,
+        0, 1, 0
+};
+
+struct sembuf sop_unlock[1] = {
+        0, -1, 0
+};
+
+sudoku_field_t (*swap_func[3])(sudoku_field_t*) = { transpose, swap_rows_small, swap_columns_small };
+
+char config_name[MAXNAME+1], log_name[MAXNAME+1], server_name[MAXNAME+1];
 int sockfd, logfd, port;
 
 void append_time_to_log_name() {
@@ -86,6 +110,27 @@ void hup() {
     close(f);
 }
 
+void worker_swapper(int func_num) {
+    close(sockfd);
+
+    if (semop(shared->semid, sop_lock, 2) == -1) {
+        logger("Unable to lock shared memory");
+        exit(1);
+    }
+
+    logger("Locked shared memory");
+    shared->field = swap_func[func_num](&shared->field);
+
+    if (semop(shared->semid, sop_unlock, 1) == -1) {
+        logger("Unable to unlock shared memory");
+        exit(1);
+    }
+    logger("Unlocked shared memory");
+
+    close(logfd);
+    exit(0);
+}
+
 void handle_request(int connfd) {
     const char *expected_command = "generate";
     char *response;
@@ -110,24 +155,80 @@ void handle_request(int connfd) {
         return;
     }
 
+    key_t ipc_key = ftok(server_name, IPC_PRIVATE);
+    logger("Got IPC KEY for shared memory");
+
+    int semid = semget(ipc_key, 1, IPC_CREAT | 0666);
+    logger("Got semaphore ID");
+
+    int shmid;
+    if ((shmid = shmget(ipc_key, sizeof(shared_t), IPC_CREAT | 0666)) == -1) {
+        logger("Unable to get shared memory ID");
+        logger(strerror(errno));
+    };
+    logger("Got shared memory ID");
+    shared = shmat(shmid, NULL, SHM_RND);
+    logger("Attached shared memory with id");
+    char buffer[10];
+    snprintf(buffer, 10, "%d", shmid);
+    logger(buffer);
+    shared->semid = semid;
+    shared->field = dummy_field();
+    base_grid(&shared->field);
+
     logger("Start generating field");
-    sudoku_field_t sudoku_field = dummy_field();
-    base_grid(&sudoku_field);
-    sudoku_field_t transposed = transpose(&sudoku_field);
 
-    sudoku_field_t swapped = swap_rows_small(&transposed);
+    int swaps = random_number(MAX_SWAPS_NUM);
 
-    sudoku_field_t swapped_again = swap_columns_small(&swapped);
-
-    for (int i = 0; i < 60; ++i) {
-        remove_cell(&swapped_again);
+    for (int i = 0; i < swaps; ++i) {
+        int func_num = random_number(3);
+        if (fork() == 0) {
+            worker_swapper(func_num);
+        }
     }
 
+    while (wait(NULL) > 0) ;
+
+    logger("wait");
+
+//    sudoku_field_t sudoku_field = dummy_field();
+//    base_grid(&sudoku_field);
+//    sudoku_field_t transposed = transpose(&sudoku_field);
+//
+//    sudoku_field_t swapped = swap_rows_small(&transposed);
+//
+//    sudoku_field_t swapped_again = swap_columns_small(&swapped);
+//
+//    for (int i = 0; i < 60; ++i) {
+//        remove_cell(&swapped_again);
+//    }
+
+    sudoku_field_t solution;
+    memcpy(&solution, &(shared->field), sizeof(sudoku_field_t));
+
+    for (int i = 0; i < 60; ++i)
+        remove_cell(&shared->field);
+
+    sudoku_field_t puzzle;
+    memcpy(&puzzle, &(shared->field), sizeof(sudoku_field_t));
+
+    if (shmctl(shmid, IPC_RMID, NULL) == -1) {
+        logger("Failed to remove shared memory");
+        logger(strerror(errno));
+    }
+
+    if (shmdt(shared) == -1) {
+        logger("Failed to detach shared memory");
+        logger(strerror(errno));
+    }
+
+    logger("Removed shared memory");
     logger("Generated sudoku");
     // send data to client
     u_short status = RESPONSE_OK;
     write(connfd, &status, sizeof(u_short));
-    write(connfd, &swapped_again, sizeof(swapped_again));
+    write(connfd, &puzzle, sizeof(puzzle));
+    write(connfd, &solution, sizeof(solution));
     logger("Sent to client");
     close(connfd);
     logger("Connection closed");
@@ -216,6 +317,8 @@ int main(int argc, char *argv[], char *envp[]) {
     else
         strcpy(config_name, CONFIGFILE);
 
+    strcpy(server_name, argv[0]);
+
     if ((configfd = open(config_name, O_RDONLY)) == -1) {
         perror(config_name);
         exit(1);
@@ -267,13 +370,15 @@ int main(int argc, char *argv[], char *envp[]) {
     // chdir("/");
 
 
-    switch(fork()) {
-        case -1:
-            perror("fork");
-            exit(1);
-        case 0:
-            master();
-    }
+    // todo remove to become a true daemon
+//    switch(fork()) {
+//        case -1:
+//            perror("fork");
+//            exit(1);
+//        case 0:
+//            master();
+//    }
+    master();
 
     return 0;
 }

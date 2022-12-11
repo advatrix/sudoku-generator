@@ -4,3 +4,8 @@
 
 #include "worker.h"
 
+int main(int argc, char *argv[], char *envp[]) {
+    // argv[1] - ipc_key
+    // argv[2] -
+
+}
