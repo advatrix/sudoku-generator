@@ -33,16 +33,24 @@ int main(int argc, char *argv[]) {
         exit(0);
     }
 
-    sudoku_field_t answer;
-    read(sockfd, &answer, sizeof(answer));
-    print(&answer);
+    const char *command = "generate";
+
+    if(write(sockfd, command, strlen(command) + 1) == -1) {
+        fprintf(stderr, "could not write to sock\n");
+        exit(EXIT_FAILURE);
+    }
+    u_short response_status;
+    read(sockfd, &response_status, sizeof(response_status));
+    if (response_status == RESPONSE_OK) {
+        sudoku_field_t answer;
+        read(sockfd, &answer, sizeof(answer));
+        print(&answer);
+    } else {
+        char response[255];
+        read(sockfd, response, response_status);
+        printf("%s\n", response);
+    }
 
     close(sockfd);
-
-
-    sudoku_field_t s = dummy_field();
-
-    print(&s);
-
     return 0;
 }
