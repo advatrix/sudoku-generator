@@ -60,15 +60,12 @@ void remove_cell(sudoku_field_t* source) {
     int row_num = random_number(FIELD_SIDE_LENGTH);
     int col_num = random_number(FIELD_SIDE_LENGTH);
 
-    // todo lock
     while (source->cells[row_num][col_num].value == SUDOKU_EMPTY) {
         row_num = random_number(FIELD_SIDE_LENGTH);
         col_num = random_number(FIELD_SIDE_LENGTH);
     }
 
     source->cells[row_num][col_num].value = SUDOKU_EMPTY;
-
-    // todo unlock
 }
 
 

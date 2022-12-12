@@ -17,17 +17,13 @@
 #include "random_dev.h"
 #include "../utils.h"
 
-#define PORT 9001
 #define BACKLOG 5
-#define COMMAND_LENGTH 9
 #define CONFIGFILE "sudoku.conf"
-#define LOGFILE "sudoku.log"
 #define MAXNAME 255
 #define LOG_MAX_MSG_SIZE 255
-#define SHARED_MEMORY_SIZE 1024
-#define MAX_SWAPS_NUM 50
-
-// todo привязать разделяемую память к глобальной переменной чтобы удалять её в term
+#define MAX_SHUFFLES_NUM 50
+#define MIN_REMOVALS_NUM 40
+#define MAX_REMOVALS_NUM 60
 
 typedef struct shared {
     int semid;
@@ -45,10 +41,12 @@ struct sembuf sop_unlock[1] = {
         0, -1, 0
 };
 
-sudoku_field_t (*swap_func[3])(sudoku_field_t*) = { transpose, swap_rows_small, swap_columns_small };
+sudoku_field_t (*shuffle_func[3])(sudoku_field_t*) = {transpose, swap_rows_small, swap_columns_small };
 
 char config_name[MAXNAME+1], log_name[MAXNAME+1], server_name[MAXNAME+1];
-int sockfd, logfd, port;
+int sockfd, logfd, port, shmid, semid;
+
+void logger(const char *message);
 
 void append_time_to_log_name() {
     char nowstr[40];
@@ -61,14 +59,110 @@ void append_time_to_log_name() {
     strcat(log_name, nowstr);
 }
 
+void log_open() {
+    if ((logfd = open(log_name, O_WRONLY | O_CREAT, 0666)) == -1) {
+        syslog(LOG_INFO, "%s %s: %s", "Cannot open log file", log_name, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+}
+
+void socket_start() {
+    // accept client connections
+    struct sockaddr_in servaddr;
+
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        logger("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+    logger("Created socket");
+
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(port);
+
+    if (bind(sockfd, (const struct sockaddr*)&servaddr, sizeof(servaddr))) {
+        logger("Socket bind failed");
+        logger(strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    logger("Bind socket");
+
+    if (listen(sockfd, BACKLOG)) {
+        logger("Listen failed");
+        exit(EXIT_FAILURE);
+    }
+    logger("Listen...");
+}
+
+void sighup_lock() {
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGHUP);
+    sigprocmask(SIG_BLOCK, &sigset, NULL);
+}
+
+void sighup_unlock() {
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGHUP);
+    sigprocmask(SIG_UNBLOCK, &sigset, NULL);
+}
+
+void log_lock() {
+    struct flock lock;
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = 0;
+    lock.l_len = 0;
+
+    if (fcntl(logfd, F_SETLKW, &lock) == -1) {
+        syslog(LOG_INFO, "Failed to lock log: %s", strerror(errno));
+    }
+}
+
+void log_unlock() {
+    struct flock lock;
+    lock.l_type = F_UNLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = 0;
+    lock.l_len = 0;
+
+    if (fcntl(logfd, F_SETLKW, &lock) == -1) {
+        syslog(LOG_INFO, "Failed to lock log: %s", strerror(errno));
+    }
+}
+
 void logger(const char *message) {
+    log_lock();
     write(logfd, message, strlen(message));
     write(logfd, "\n", 1);
+    log_unlock();
+}
+
+void logger_err(const char *message) {
+    log_lock();
+    write(logfd, message, strlen(message));
+    write(logfd, ": ", 2);
+    write(logfd, strerror(errno), strlen(strerror(errno)));
+    write(logfd, "\n", 1);
+    log_unlock();
 }
 
 void term() {
     logger("Finishing, waiting for children to exit...");
     wait(NULL); // wait for all children to exit
+    logger("Detaching shared memory...");
+    if (shmctl(shmid, IPC_RMID, NULL) == -1) {
+        logger_err("Failed to remove shared memory");
+    }
+
+    if (shmdt(shared) == -1) {
+        logger_err("Failed to detach shared memory");
+    }
+    logger("Removing semaphore...");
+    if (semctl(semid, 1, IPC_RMID) == -1) {
+        logger_err("Failed to remove semaphore");
+    }
     logger("Closing socket...");
     close(sockfd);
     logger("Closing log...");
@@ -97,36 +191,66 @@ void hup() {
         exit(1);
     }
     read(f, config, st.st_size);
+    config[st.st_size] = '\0';
     close(f);
 
     char *conf_start = config;
-    port = to_long(strsep(&config, "\n"));
+    int new_port = to_long(strsep(&config, "\n"));
     log_name[0] = '\0';
-    strcpy(log_name, config);
+    strcpy(log_name, strsep(&config, "\n"));
     // add current timestamp to log file name
     append_time_to_log_name();
-    free(conf_start);
+    close(logfd);
+    log_open();
+    logger("Master restarted logging");
 
+    if (new_port != port) {
+        logger("Port changed");
+        port = new_port;
+        logger("Set new port");
+        syslog(LOG_INFO, "Started listening on %d", port);
+        if (close(sockfd) == -1) {
+            logger_err("Failed to close old socket");
+        };
+        logger("Recreating socket for new port...");
+        socket_start();
+    }
+
+    free(conf_start);
     close(f);
+    logger("Reconfigured.");
 }
 
-void worker_swapper(int func_num) {
-    close(sockfd);
-
+void shared_lock(){
     if (semop(shared->semid, sop_lock, 2) == -1) {
         logger("Unable to lock shared memory");
         exit(1);
     }
-
     logger("Locked shared memory");
-    shared->field = swap_func[func_num](&shared->field);
+}
 
+void shared_unlock() {
     if (semop(shared->semid, sop_unlock, 1) == -1) {
         logger("Unable to unlock shared memory");
         exit(1);
     }
     logger("Unlocked shared memory");
+}
 
+void worker_shuffler(int func_num) {
+    close(sockfd);
+    shared_lock();
+    shared->field = shuffle_func[func_num](&shared->field);
+    shared_unlock();
+    close(logfd);
+    exit(0);
+}
+
+void worker_remover() {
+    close(sockfd);
+    shared_lock();
+    remove_cell(&shared->field);
+    shared_unlock();
     close(logfd);
     exit(0);
 }
@@ -155,74 +279,34 @@ void handle_request(int connfd) {
         return;
     }
 
-    key_t ipc_key = ftok(server_name, IPC_PRIVATE);
-    logger("Got IPC KEY for shared memory");
-
-    int semid = semget(ipc_key, 1, IPC_CREAT | 0666);
-    logger("Got semaphore ID");
-
-    int shmid;
-    if ((shmid = shmget(ipc_key, sizeof(shared_t), IPC_CREAT | 0666)) == -1) {
-        logger("Unable to get shared memory ID");
-        logger(strerror(errno));
-    };
-    logger("Got shared memory ID");
-    shared = shmat(shmid, NULL, SHM_RND);
-    logger("Attached shared memory with id");
-    char buffer[10];
-    snprintf(buffer, 10, "%d", shmid);
-    logger(buffer);
-    shared->semid = semid;
+    shared_lock();
     shared->field = dummy_field();
     base_grid(&shared->field);
+    shared_unlock();
 
     logger("Start generating field");
 
-    int swaps = random_number(MAX_SWAPS_NUM);
-
-    for (int i = 0; i < swaps; ++i) {
+    int shuffles_count = random_number(MAX_SHUFFLES_NUM);
+    for (int i = 0; i < shuffles_count; ++i) {
         int func_num = random_number(3);
         if (fork() == 0) {
-            worker_swapper(func_num);
+            worker_shuffler(func_num);
         }
     }
-
     while (wait(NULL) > 0) ;
-
-    logger("wait");
-
-//    sudoku_field_t sudoku_field = dummy_field();
-//    base_grid(&sudoku_field);
-//    sudoku_field_t transposed = transpose(&sudoku_field);
-//
-//    sudoku_field_t swapped = swap_rows_small(&transposed);
-//
-//    sudoku_field_t swapped_again = swap_columns_small(&swapped);
-//
-//    for (int i = 0; i < 60; ++i) {
-//        remove_cell(&swapped_again);
-//    }
-
     sudoku_field_t solution;
     memcpy(&solution, &(shared->field), sizeof(sudoku_field_t));
+    logger("Shuffling finished");
 
-    for (int i = 0; i < 60; ++i)
-        remove_cell(&shared->field);
-
+    int removals_count = random_number(MAX_REMOVALS_NUM - MIN_REMOVALS_NUM) + MIN_REMOVALS_NUM;
+    for (int i = 0; i < removals_count; ++i)
+        if (fork() == 0)
+            worker_remover();
+    while (wait(NULL) > 0) ;
     sudoku_field_t puzzle;
     memcpy(&puzzle, &(shared->field), sizeof(sudoku_field_t));
+    logger("Removal finished");
 
-    if (shmctl(shmid, IPC_RMID, NULL) == -1) {
-        logger("Failed to remove shared memory");
-        logger(strerror(errno));
-    }
-
-    if (shmdt(shared) == -1) {
-        logger("Failed to detach shared memory");
-        logger(strerror(errno));
-    }
-
-    logger("Removed shared memory");
     logger("Generated sudoku");
     // send data to client
     u_short status = RESPONSE_OK;
@@ -238,53 +322,46 @@ void master() {
     setsid();
     openlog("sudoku_master", LOG_PID, LOG_USER);
     syslog(LOG_INFO, "%s", "Started");
-    if ((logfd = open(log_name, O_WRONLY | O_CREAT, 0666)) == -1) {
-        syslog(LOG_INFO, "%s %s: %s", "Cannot open log file", log_name, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
 
+    log_open();
     logger("Master started logging");
 
+    key_t ipc_key = ftok(server_name, IPC_PRIVATE);
+    logger("Got IPC KEY for shared memory");
 
-    // accept client connections
-    int connfd;
+    if ((semid = semget(ipc_key, 1, IPC_CREAT | 0666)) == -1) {
+        logger_err("Failed to get semaphore ID");
+    }
+    logger("Got semaphore ID");
+    if ((shmid = shmget(ipc_key, sizeof(shared_t), IPC_CREAT | 0666)) == -1) {
+        logger_err("Unable to get shared memory ID");
+    }
+    logger("Got shared memory ID");
+    if ((shared = shmat(shmid, NULL, SHM_RND)) == (void *)-1) {
+        logger_err("Failed to attach shared memory");
+    }
+    logger("Attached shared memory with id");
+    char buffer[10];
+    snprintf(buffer, 10, "%d", shmid);
+    logger(buffer);
+    shared->semid = semid;
+    struct sockaddr_in clientaddr;
     unsigned int client_len;
-    struct sockaddr_in servaddr, clientaddr;
-
-    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        logger("Socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-    logger("Created socket");
-
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port = htons(port);
-
-    if (bind(sockfd, (const struct sockaddr*)&servaddr, sizeof(servaddr))) {
-        logger("Socket bind failed");
-        logger(strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-    logger("Bind socket");
-
-    if (listen(sockfd, BACKLOG)) {
-        logger("Listen failed");
-        exit(EXIT_FAILURE);
-    }
-    logger("Listen...");
-
+    socket_start();
+    int connfd;
     for (;;) {
         if ((connfd = accept(sockfd, (struct sockaddr*)&clientaddr, &client_len)) == -1) {
             perror("accept");
             exit(EXIT_FAILURE);
         }
+        sighup_lock();
         char accepted_message[255];
         strcpy(accepted_message, "Accepted request from ");
         strcat(accepted_message, inet_ntoa(clientaddr.sin_addr));
         logger(accepted_message);
 
         handle_request(connfd);
+        sighup_unlock();
     }
 
 }
@@ -343,16 +420,13 @@ int main(int argc, char *argv[], char *envp[]) {
 
     char *conf_start = config;
     port = to_long(strsep(&config, "\n"));
-    strcpy(log_name, config);
-
-    printf("Config name: %s\n", log_name);
+    strcpy(log_name, strsep(&config, "\n"));
 
     // add current timestamp to log file name
     append_time_to_log_name();
     printf("Config name: %s\n", log_name);
 
     free(conf_start);
-    printf("Config name: %s\n", log_name);
 
     printf("Becoming a daemon...\n");
 
@@ -369,16 +443,13 @@ int main(int argc, char *argv[], char *envp[]) {
     // sudo needed
     // chdir("/");
 
-
-    // todo remove to become a true daemon
-//    switch(fork()) {
-//        case -1:
-//            perror("fork");
-//            exit(1);
-//        case 0:
-//            master();
-//    }
-    master();
+    switch(fork()) {
+        case -1:
+            perror("fork");
+            exit(1);
+        case 0:
+            master();
+    }
 
     return 0;
 }
